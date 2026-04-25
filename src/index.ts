@@ -339,6 +339,15 @@ async function main() {
     const app = express();
     app.use(express.json());
 
+    // CORS — required for browser-based MCP clients (claude.ai, Claude Desktop)
+    app.use((req, res, next) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+      res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, mcp-session-id');
+      if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+      next();
+    });
+
     // Per-session MCP transport map (keyed by MCP transport session ID)
     const transports = new Map<string, StreamableHTTPServerTransport>();
 
@@ -360,10 +369,24 @@ async function main() {
         issuer: base,
         authorization_endpoint: `${base}/authorize`,
         token_endpoint: `${base}/token`,
+        registration_endpoint: `${base}/register`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
         code_challenge_methods_supported: ['S256'],
         token_endpoint_auth_methods_supported: ['none'],
+      });
+    });
+
+    // RFC 7591 — Dynamic Client Registration
+    app.post('/register', express.json(), (req, res) => {
+      const { redirect_uris = [], client_name = 'mcp-client' } = req.body ?? {};
+      res.status(201).json({
+        client_id: randomUUID(),
+        client_name,
+        redirect_uris,
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
       });
     });
 
