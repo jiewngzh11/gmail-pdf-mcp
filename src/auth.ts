@@ -302,6 +302,8 @@ export function exchangeMcpCode(code: string, codeVerifier: string, redirectUri:
 
 /** Validate a bearer token. Returns the auth session ID or null. */
 export function validateBearerToken(token: string): string | null {
+  const staticToken = process.env.STATIC_BEARER_TOKEN;
+  if (staticToken && token === staticToken) return 'static';
   return bearerTokens.get(token) ?? null;
 }
 
@@ -309,10 +311,12 @@ export function validateBearerToken(token: string): string | null {
 
 /**
  * Returns an OAuth2 client for the session:
- * 1. Session-level token from Web OAuth (highest priority)
- * 2. Key Vault / local token.json fallback
+ * 1. 'static' session → Key Vault / local fallback (for unattended scheduled tasks)
+ * 2. Session-level token from Web OAuth (per-user interactive)
+ * 3. Key Vault / local token.json fallback
  */
 export async function getAuthClientForSession(sessionId: string): Promise<OAuth2Client> {
+  if (sessionId === 'static') return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
   if (sessionClients.has(sessionId)) return sessionClients.get(sessionId)!;
   return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
 }
