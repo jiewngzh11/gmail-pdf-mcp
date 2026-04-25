@@ -25,6 +25,7 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          auth-type: SERVICE_PRINCIPAL
 
       - name: Log in to Azure Container Registry
         uses: azure/docker-login@v1
@@ -55,6 +56,7 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          auth-type: SERVICE_PRINCIPAL
 
       - name: Deploy to Container Apps
         uses: azure/container-apps-deploy-action@v1
