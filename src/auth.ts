@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import http from 'http';
@@ -12,20 +13,11 @@ const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
 
 const isAzure = process.env.AZURE_DEPLOYMENT === 'true';
 
-// Per-session authenticated clients (keyed by MCP session ID)
+// Per-session OAuth2 clients (keyed by MCP session ID)
 const sessionClients = new Map<string, OAuth2Client>();
 
-// Device flow state: device_code → sessionId + polling timer
-interface DeviceAuthState {
-  sessionId: string;
-  deviceCode: string;
-  interval: number;
-  expiresAt: number;
-  timer: ReturnType<typeof setInterval> | null;
-  authorized: boolean;
-  error?: string;
-}
-const deviceAuthStates = new Map<string, DeviceAuthState>(); // sessionId → state
+// Pending Web OAuth states: state UUID → session ID
+const pendingOAuthStates = new Map<string, string>();
 
 // ── Azure Key Vault helpers ────────────────────────────────────────────────────
 
@@ -48,8 +40,9 @@ export async function saveRefreshTokenToKeyVault(refreshToken: string): Promise<
   console.error('refresh_token saved to Key Vault.');
 }
 
-// ── Credentials loader ─────────────────────────────────────────────────────────
+// ── Credential loaders ─────────────────────────────────────────────────────────
 
+/** Desktop/installed app credentials — used for Key Vault fallback & local setup */
 function loadCredentials(): { clientId: string; clientSecret: string } {
   if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     return {
@@ -60,7 +53,22 @@ function loadCredentials(): { clientId: string; clientSecret: string } {
   throw new Error('GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars not set');
 }
 
-// ── Azure mode: Key Vault refresh_token (fallback / admin-set token) ───────────
+/** Web application credentials — used for per-user redirect OAuth on Azure */
+function loadWebCredentials(): { clientId: string; clientSecret: string } {
+  const clientId = process.env.GOOGLE_WEB_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_WEB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error('GOOGLE_WEB_CLIENT_ID / GOOGLE_WEB_CLIENT_SECRET env vars not set');
+  }
+  return { clientId, clientSecret };
+}
+
+function getOAuthCallbackUrl(): string {
+  return process.env.OAUTH_CALLBACK_URL ??
+    'https://gmail-pdf-mcp.livelymoss-77bbcaee.eastasia.azurecontainerapps.io/oauth2callback';
+}
+
+// ── Azure mode: Key Vault refresh_token (admin-set fallback) ───────────────────
 
 async function getAzureOAuth2Client(): Promise<OAuth2Client> {
   const { clientId, clientSecret } = loadCredentials();
@@ -77,11 +85,8 @@ async function getAzureOAuth2Client(): Promise<OAuth2Client> {
 
 async function loadLocalToken(): Promise<Credentials | null> {
   try {
-    const raw = await fs.readFile(TOKEN_PATH, 'utf-8');
-    return JSON.parse(raw) as Credentials;
-  } catch {
-    return null;
-  }
+    return JSON.parse(await fs.readFile(TOKEN_PATH, 'utf-8')) as Credentials;
+  } catch { return null; }
 }
 
 async function saveLocalToken(credentials: Credentials): Promise<void> {
@@ -93,8 +98,7 @@ async function buildOAuth2Client(): Promise<OAuth2Client> {
     const { clientId, clientSecret } = loadCredentials();
     return new OAuth2Client(clientId, clientSecret, 'http://localhost:3000/oauth2callback');
   } catch {
-    const credRaw = await fs.readFile(CREDENTIALS_PATH, 'utf-8');
-    const { installed } = JSON.parse(credRaw);
+    const { installed } = JSON.parse(await fs.readFile(CREDENTIALS_PATH, 'utf-8'));
     return new OAuth2Client(installed.client_id, installed.client_secret, 'http://localhost:3000/oauth2callback');
   }
 }
@@ -140,132 +144,69 @@ async function getLocalOAuth2Client(): Promise<OAuth2Client> {
   return client;
 }
 
-// ── Device Flow (multi-user self-service authorization) ────────────────────────
+// ── Web OAuth redirect flow (per-user, Azure mode) ─────────────────────────────
 
-export interface DeviceAuthResult {
-  verification_url: string;
-  user_code: string;
-  expires_in: number;
-  interval: number;
-}
+/**
+ * Generate a Google OAuth URL for the session. The redirect goes back to
+ * the Container App's /oauth2callback route.
+ */
+export function generateWebAuthUrl(sessionId: string): string {
+  const { clientId, clientSecret } = loadWebCredentials();
+  const callbackUrl = getOAuthCallbackUrl();
+  const client = new OAuth2Client(clientId, clientSecret, callbackUrl);
 
-export async function startDeviceAuth(sessionId: string): Promise<DeviceAuthResult> {
-  const { clientId } = loadCredentials();
+  const state = randomUUID();
+  pendingOAuthStates.set(state, sessionId);
+  // Auto-expire state after 30 minutes
+  setTimeout(() => pendingOAuthStates.delete(state), 30 * 60 * 1000);
 
-  // Request device + user code from Google
-  const resp = await fetch('https://oauth2.googleapis.com/device/code', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      scope: SCOPES.join(' '),
-    }),
+  return client.generateAuthUrl({
+    access_type: 'offline',
+    scope: SCOPES,
+    prompt: 'consent',
+    state,
   });
-  if (!resp.ok) throw new Error(`Device auth request failed: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json() as {
-    device_code: string;
-    user_code: string;
-    verification_url: string;
-    expires_in: number;
-    interval: number;
-  };
-
-  const state: DeviceAuthState = {
-    sessionId,
-    deviceCode: data.device_code,
-    interval: data.interval,
-    expiresAt: Date.now() + data.expires_in * 1000,
-    timer: null,
-    authorized: false,
-  };
-
-  // Stop any previous pending auth for this session
-  const prev = deviceAuthStates.get(sessionId);
-  if (prev?.timer) clearInterval(prev.timer);
-
-  deviceAuthStates.set(sessionId, state);
-  startDevicePolling(sessionId);
-
-  return {
-    verification_url: data.verification_url,
-    user_code: data.user_code,
-    expires_in: data.expires_in,
-    interval: data.interval,
-  };
 }
 
-function startDevicePolling(sessionId: string) {
-  const state = deviceAuthStates.get(sessionId);
-  if (!state) return;
+/**
+ * Called by the /oauth2callback Express route to exchange the code for tokens
+ * and store them for the associated session.
+ */
+export async function completeOAuthCallback(state: string, code: string): Promise<void> {
+  const sessionId = pendingOAuthStates.get(state);
+  if (!sessionId) throw new Error('Invalid or expired authorization state. Please call authorize_gmail again.');
+  pendingOAuthStates.delete(state);
 
-  const { clientId, clientSecret } = loadCredentials();
+  const { clientId, clientSecret } = loadWebCredentials();
+  const callbackUrl = getOAuthCallbackUrl();
+  const client = new OAuth2Client(clientId, clientSecret, callbackUrl);
 
-  state.timer = setInterval(async () => {
-    if (Date.now() > state.expiresAt) {
-      clearInterval(state.timer!);
-      state.error = 'Authorization expired';
-      deviceAuthStates.delete(sessionId);
-      return;
-    }
+  const { tokens } = await client.getToken(code);
+  if (!tokens.access_token && !tokens.refresh_token) throw new Error('No tokens returned from Google');
 
-    try {
-      const resp = await fetch('https://oauth2.googleapis.com/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: clientId,
-          client_secret: clientSecret,
-          device_code: state.deviceCode,
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        }),
-      });
-
-      const data = await resp.json() as Record<string, string>;
-
-      if (data['access_token']) {
-        clearInterval(state.timer!);
-        state.authorized = true;
-
-        const client = new OAuth2Client(clientId, clientSecret);
-        client.setCredentials({
-          access_token: data['access_token'],
-          refresh_token: data['refresh_token'],
-          expiry_date: Date.now() + parseInt(data['expires_in'] ?? '3600') * 1000,
-        });
-        sessionClients.set(sessionId, client);
-        deviceAuthStates.delete(sessionId);
-        console.error(`[auth] Session ${sessionId.slice(0, 8)} authorized via device flow`);
-      } else if (data['error'] === 'access_denied' || data['error'] === 'expired_token') {
-        clearInterval(state.timer!);
-        state.error = data['error'];
-        deviceAuthStates.delete(sessionId);
-      }
-      // 'authorization_pending' or 'slow_down' → just wait
-    } catch {
-      // Network error — continue polling
-    }
-  }, (state.interval + 1) * 1000);
+  client.setCredentials(tokens);
+  sessionClients.set(sessionId, client);
+  console.error(`[auth] Session ${sessionId.slice(0, 8)} authorized via Web OAuth`);
 }
 
-export function getDeviceAuthStatus(sessionId: string): 'authorized' | 'pending' | 'expired' | 'none' {
+export function getSessionAuthStatus(sessionId: string): 'authorized' | 'pending' | 'none' {
   if (sessionClients.has(sessionId)) return 'authorized';
-  const state = deviceAuthStates.get(sessionId);
-  if (!state) return 'none';
-  if (state.error) return 'expired';
-  return 'pending';
+  // Check if there's a pending state for this session
+  for (const sid of pendingOAuthStates.values()) {
+    if (sid === sessionId) return 'pending';
+  }
+  return 'none';
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
- * Returns an OAuth2 client for the given session:
- * 1. Session-level token (from device flow) — highest priority
- * 2. Key Vault / token.json fallback
+ * Returns an OAuth2 client for the session:
+ * 1. Session-level token from Web OAuth (highest priority)
+ * 2. Key Vault / local token.json fallback
  */
 export async function getAuthClientForSession(sessionId: string): Promise<OAuth2Client> {
-  if (sessionClients.has(sessionId)) {
-    return sessionClients.get(sessionId)!;
-  }
+  if (sessionClients.has(sessionId)) return sessionClients.get(sessionId)!;
   return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
 }
 

@@ -9,7 +9,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { getAuthClientForSession, startDeviceAuth, getDeviceAuthStatus } from './auth.js';
+import { getAuthClientForSession, generateWebAuthUrl, completeOAuthCallback, getSessionAuthStatus } from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
@@ -181,31 +181,26 @@ const TOOLS = [
 // ── Tool handlers (all receive sessionId for per-session auth) ─────────────────
 
 async function handleAuthorizeGmail(sessionId: string) {
-  const result = await startDeviceAuth(sessionId);
+  const authUrl = generateWebAuthUrl(sessionId);
   return {
-    verification_url: result.verification_url,
-    user_code: result.user_code,
-    expires_in_seconds: result.expires_in,
+    auth_url: authUrl,
     message: [
-      '請依照以下步驟完成 Gmail 授權：',
+      '請點選以下連結完成 Gmail 授權（在瀏覽器開啟）：',
       '',
-      `1. 開啟瀏覽器，前往：${result.verification_url}`,
-      `2. 輸入以下代碼（不含空格也可）：${result.user_code}`,
-      '3. 登入你的 Google 帳號並點選「允許」',
+      authUrl,
       '',
-      `授權碼 ${Math.floor(result.expires_in / 60)} 分鐘內有效。`,
-      '完成後可呼叫 check_gmail_auth 確認狀態，或直接呼叫其他工具。',
+      '完成授權後，連結頁面會顯示「授權成功」。',
+      '之後即可直接使用 search_emails、batch_convert_emails 等工具。',
     ].join('\n'),
   };
 }
 
 async function handleCheckGmailAuth(sessionId: string) {
-  const status = getDeviceAuthStatus(sessionId);
+  const status = getSessionAuthStatus(sessionId);
   const messages: Record<string, string> = {
     authorized: '✅ 已授權，可以使用所有工具。',
-    pending: '⏳ 等待授權中，請完成瀏覽器的 Google 登入步驟。',
-    expired: '❌ 授權碼已過期，請重新呼叫 authorize_gmail。',
-    none: '⚠️ 尚未開始授權。請呼叫 authorize_gmail 取得授權碼。',
+    pending: '⏳ 等待授權中，請在瀏覽器完成 Google 登入。',
+    none: '⚠️ 尚未授權。請呼叫 authorize_gmail 取得授權連結。',
   };
   return { status, message: messages[status] };
 }
@@ -380,6 +375,24 @@ async function main() {
       const server = createMcpServer(newSessionId);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
+    });
+
+    // OAuth2 callback — Google redirects here after user authorization
+    app.get('/oauth2callback', async (req, res) => {
+      const { code, state, error } = req.query;
+      if (error || !code || !state) {
+        res.status(400).send('<h1 style="font-family:sans-serif">授權失敗，請重新呼叫 authorize_gmail。</h1>');
+        return;
+      }
+      try {
+        await completeOAuthCallback(state as string, code as string);
+        res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;text-align:center;padding:60px">
+          <h1>✅ Gmail 授權成功！</h1>
+          <p>你現在可以關閉此視窗，並在 Claude 中使用 search_emails、batch_convert_emails 等工具。</p>
+        </body></html>`);
+      } catch (err) {
+        res.status(400).send(`<h1 style="font-family:sans-serif">❌ 授權失敗：${(err as Error).message}</h1>`);
+      }
     });
 
     // Health check for Azure Container Apps
