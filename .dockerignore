@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.git/
+credentials.json
+token.json
+.env.local
+output/
+*.pdf
+.local-chromium/

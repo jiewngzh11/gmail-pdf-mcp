@@ -1,0 +1,34 @@
+{
+  "name": "gmail-pdf-mcp",
+  "version": "1.0.0",
+  "description": "Gmail to PDF MCP Server - search emails and export to PDF with attachments",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "dev:auth": "ts-node src/auth.ts",
+    "dev:gmail": "ts-node src/gmail.ts",
+    "dev:pdf": "ts-node src/pdf-converter.ts",
+    "setup:azure-token": "ts-node src/setup-azure-token.ts"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.4.1",
+    "@azure/keyvault-secrets": "^4.8.0",
+    "@azure/storage-blob": "^12.24.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "google-auth-library": "^9.14.1",
+    "googleapis": "^140.0.1",
+    "open": "^8.4.2",
+    "pdf-lib": "^1.17.1",
+    "puppeteer": "^23.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}
