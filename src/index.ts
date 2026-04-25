@@ -17,7 +17,7 @@ import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
 import { mergeEmailWithAttachments, countPdfPages } from './pdf-merger.js';
-import { savePdf, saveToDrive, downloadFromBlob } from './storage.js';
+import { saveToLocal, saveToDrive } from './storage.js';
 import { buildOutputPaths, getDefaultOutputDir } from './file-manager.js';
 import type { ConversionResult, BatchConversionResult } from './types.js';
 
@@ -51,17 +51,18 @@ async function doConvertEmail(
 
   const pages = await countPdfPages(finalPdf);
 
-  const saved = await savePdf(finalPdf, paths.blobPath, paths.localDir, paths.filename);
-
-  // Upload to the user's Google Drive (best-effort, non-fatal)
+  // Primary: upload to user's Google Drive
   let driveUrl: string | undefined;
   let driveFileId: string | undefined;
+  let localPath: string | undefined;
   try {
     const drive = await saveToDrive(auth, finalPdf, message.senderName, paths.filename);
     driveUrl = drive.driveUrl;
     driveFileId = drive.driveFileId;
   } catch (err) {
+    // Fallback: save to local disk (local / stdio mode)
     errors.push(`Drive upload failed: ${(err as Error).message}`);
+    localPath = await saveToLocal(finalPdf, paths.localDir, paths.filename);
   }
 
   return {
@@ -70,11 +71,9 @@ async function doConvertEmail(
     subject: message.subject,
     senderName: message.senderName,
     filename: paths.filename,
-    pdfUrl: saved.pdfUrl,
-    blobName: saved.blobName,
-    localPath: saved.localPath,
     driveUrl,
     driveFileId,
+    localPath,
     pages,
     attachmentsMerged,
     errors,
@@ -172,24 +171,6 @@ const TOOLS = [
         },
       },
       required: ['query'],
-    },
-  },
-  {
-    name: 'download_pdf_locally',
-    description: '將 Azure Blob 中的 PDF 下載到本機指定路徑（Azure 模式使用）',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        blob_name: {
-          type: 'string',
-          description: 'Blob 路徑（從 convert_email_to_pdf 的 blob_name 取得）',
-        },
-        local_path: {
-          type: 'string',
-          description: '本機儲存完整路徑，例如 C:\\Downloads\\email.pdf',
-        },
-      },
-      required: ['blob_name', 'local_path'],
     },
   },
 ];
@@ -294,13 +275,6 @@ async function handleBatchConvertEmails(sessionId: string, args: Record<string, 
   return { processed, failed, results };
 }
 
-async function handleDownloadPdfLocally(args: Record<string, unknown>) {
-  const blobName = String(args['blob_name']);
-  const localPath = String(args['local_path']);
-  await downloadFromBlob(blobName, localPath);
-  return { success: true, local_path: localPath };
-}
-
 // ── MCP Server factory ─────────────────────────────────────────────────────────
 
 function createMcpServer(sessionId: string): Server {
@@ -335,9 +309,6 @@ function createMcpServer(sessionId: string): Server {
           break;
         case 'batch_convert_emails':
           result = await handleBatchConvertEmails(sessionId, args as Record<string, unknown>);
-          break;
-        case 'download_pdf_locally':
-          result = await handleDownloadPdfLocally(args as Record<string, unknown>);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);

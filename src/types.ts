@@ -43,11 +43,9 @@ export interface ConversionResult {
   subject: string;
   senderName: string;
   filename: string;
-  pdfUrl?: string;       // Azure Blob SAS URL
-  blobName?: string;     // Azure Blob path
-  localPath?: string;    // Local file path (local mode)
   driveUrl?: string;     // Google Drive share link
   driveFileId?: string;  // Google Drive file ID
+  localPath?: string;    // Local file path (local / stdio mode)
   pages: number;
   attachmentsMerged: number;
   errors: string[];
@@ -57,9 +55,4 @@ export interface BatchConversionResult {
   processed: number;
   failed: number;
   results: ConversionResult[];
-}
-
-export interface StorageConfig {
-  accountName: string;
-  containerName: string;
 }
