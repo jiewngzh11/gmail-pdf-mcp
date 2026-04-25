@@ -14,7 +14,7 @@ import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
 import { mergeEmailWithAttachments, countPdfPages } from './pdf-merger.js';
-import { savePdf, downloadFromBlob } from './storage.js';
+import { savePdf, saveToDrive, downloadFromBlob } from './storage.js';
 import { buildOutputPaths, getDefaultOutputDir } from './file-manager.js';
 import type { ConversionResult, BatchConversionResult } from './types.js';
 
@@ -50,6 +50,17 @@ async function doConvertEmail(
 
   const saved = await savePdf(finalPdf, paths.blobPath, paths.localDir, paths.filename);
 
+  // Upload to the user's Google Drive (best-effort, non-fatal)
+  let driveUrl: string | undefined;
+  let driveFileId: string | undefined;
+  try {
+    const drive = await saveToDrive(auth, finalPdf, message.senderName, paths.filename);
+    driveUrl = drive.driveUrl;
+    driveFileId = drive.driveFileId;
+  } catch (err) {
+    errors.push(`Drive upload failed: ${(err as Error).message}`);
+  }
+
   return {
     success: true,
     messageId,
@@ -59,6 +70,8 @@ async function doConvertEmail(
     pdfUrl: saved.pdfUrl,
     blobName: saved.blobName,
     localPath: saved.localPath,
+    driveUrl,
+    driveFileId,
     pages,
     attachmentsMerged,
     errors,

@@ -46,6 +46,8 @@ export interface ConversionResult {
   pdfUrl?: string;       // Azure Blob SAS URL
   blobName?: string;     // Azure Blob path
   localPath?: string;    // Local file path (local mode)
+  driveUrl?: string;     // Google Drive share link
+  driveFileId?: string;  // Google Drive file ID
   pages: number;
   attachmentsMerged: number;
   errors: string[];

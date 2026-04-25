@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { Readable } from 'stream';
 import {
   BlobServiceClient,
   StorageSharedKeyCredential,
@@ -7,6 +8,7 @@ import {
   BlobSASPermissions,
 } from '@azure/storage-blob';
 import { DefaultAzureCredential } from '@azure/identity';
+import type { OAuth2Client } from 'google-auth-library';
 
 const isAzure = process.env.AZURE_DEPLOYMENT === 'true';
 
@@ -120,6 +122,64 @@ export async function downloadFromBlob(
   await fs.mkdir(dir, { recursive: true });
   await blockBlobClient.downloadToFile(localPath);
 }
+
+// ── Google Drive helpers ───────────────────────────────────────────────────────
+
+async function getOrCreateDriveFolder(
+  drive: any,
+  name: string,
+  parentId?: string
+): Promise<string> {
+  const escaped = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const parentQ = parentId ? `'${parentId}' in parents` : `'root' in parents`;
+  const q = `name='${escaped}' and mimeType='application/vnd.google-apps.folder' and trashed=false and ${parentQ}`;
+
+  const res = await drive.files.list({ q, fields: 'files(id)', spaces: 'drive' });
+  if (res.data.files?.length > 0) return res.data.files[0].id as string;
+
+  const folder = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: 'application/vnd.google-apps.folder',
+      ...(parentId ? { parents: [parentId] } : {}),
+    },
+    fields: 'id',
+  });
+  return folder.data.id as string;
+}
+
+/**
+ * Upload a PDF to the user's Google Drive under:
+ *   Gmail PDF MCP / {senderName} / {filename}
+ * Returns a shareable view link (anyone with link can view).
+ */
+export async function saveToDrive(
+  auth: OAuth2Client,
+  pdfBuffer: Buffer,
+  senderName: string,
+  filename: string
+): Promise<{ driveUrl: string; driveFileId: string }> {
+  const { google } = await import('googleapis');
+  const drive = google.drive({ version: 'v3', auth });
+
+  const rootId = await getOrCreateDriveFolder(drive, 'Gmail PDF MCP');
+  const senderId = await getOrCreateDriveFolder(drive, senderName, rootId);
+
+  const file = await drive.files.create({
+    requestBody: { name: filename, parents: [senderId] },
+    media: { mimeType: 'application/pdf', body: Readable.from(pdfBuffer) },
+    fields: 'id,webViewLink',
+  });
+
+  await drive.permissions.create({
+    fileId: file.data.id!,
+    requestBody: { role: 'reader', type: 'anyone' },
+  });
+
+  return { driveUrl: file.data.webViewLink!, driveFileId: file.data.id! };
+}
+
+// ── Unified save (Blob + Drive) ────────────────────────────────────────────────
 
 // Save PDF using the appropriate backend
 export async function savePdf(
