@@ -11,9 +11,11 @@
 一個 MCP (Model Context Protocol) Server，讓 Claude 能夠：
 - 搜尋 Gmail 中主旨含關鍵字的郵件
 - 將郵件（含附件）轉換為 PDF
-- 儲存 PDF 至 Azure Blob Storage 並回傳下載連結
+- 自動儲存 PDF 至使用者的 **Google Drive**（`Gmail PDF MCP/{寄件人}/` 資料夾）
 
-技術棧：Node.js + TypeScript，Puppeteer（HTML→PDF），pdf-lib（合併），Gmail API，Azure Container Apps（部署），Azure Blob Storage（儲存），GitHub Actions（CI/CD）。
+技術棧：Node.js + TypeScript，Puppeteer（HTML→PDF），pdf-lib（合併），Gmail API，Google Drive API，Azure Container Apps（部署），GitHub Actions（CI/CD）。
+
+**授權流程**：符合 MCP Authorization 規範（RFC 6749）。Claude Desktop App 或 Claude Code 連上 MCP Server 時，會**自動跳出瀏覽器要求授權**（Gmail 讀取 + Google Drive 存檔），不需要手動呼叫任何工具。
 
 ---
 
@@ -21,7 +23,7 @@
 
 - **Google Cloud Console** 帳號（用來建立 OAuth2 憑證）
 - **GitHub** 帳號（用來 Fork 專案並觸發自動部署）
-- **Azure** 帳號（用來建立所有雲端資源）
+- **Azure** 帳號（用來建立雲端資源）
 
 ---
 
@@ -29,13 +31,13 @@
 
 ```
 1. Fork GitHub repo
-2. 建立 Google OAuth2 憑證（2 個 client）
-3. 建立 Azure 資源（5 個）
+2. 建立 Google OAuth2 憑證（1 個 Web 應用程式 client）
+3. 建立 Azure 資源（4 個）
 4. 設定 GitHub Secrets（7 個）
 5. 設定 Azure Container App 環境變數
 6. Push 觸發 CI/CD 自動部署
 7. 設定 Claude Desktop App / Claude Code
-8. 授權 Gmail 並測試
+8. 測試
 ```
 
 ---
@@ -64,27 +66,27 @@ https://github.com/<使用者GitHub帳號>/gmail-pdf-mcp
 1. 開啟 [https://console.cloud.google.com](https://console.cloud.google.com)
 2. 建立新專案（或使用現有專案），例如命名為 `gmail-pdf-mcp`
 3. 左側選單 → **API 和服務** → **已啟用的 API 和服務** → 點擊 **+ 啟用 API 和服務**
-4. 搜尋 `Gmail API` → 點擊啟用
+4. 搜尋並啟用 `Gmail API`
+5. 再次點擊 **+ 啟用 API 和服務**，搜尋並啟用 `Google Drive API`
 
 ### 2-2. 設定 OAuth 同意畫面
 
 1. 左側 → **OAuth 同意畫面**
 2. User Type 選 **外部** → 建立
 3. 填入應用程式名稱（例如 `Gmail PDF MCP`）、支援電子郵件
-4. 範圍頁面：點擊 **新增或移除範圍** → 搜尋 `gmail.readonly` → 勾選 → 儲存
+4. 範圍頁面：點擊 **新增或移除範圍**，搜尋並勾選：
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/drive.file`
 5. 測試使用者：加入自己的 Gmail 帳號
 6. 完成
 
-### 2-3. 建立「Web 應用程式」OAuth client（用於多使用者授權）
+### 2-3. 建立「Web 應用程式」OAuth client
 
 1. 左側 → **憑證** → **+ 建立憑證** → **OAuth 用戶端 ID**
 2. 應用程式類型選 **網路應用程式**
 3. 名稱輸入 `gmail-pdf-web`
-4. 已授權的重新導向 URI，點擊 **+ 新增 URI**，輸入：
-   ```
-   https://gmail-pdf-mcp.<你的Container App domain>/oauth2callback
-   ```
-   > **注意**：此時還不知道 domain，先填入以下佔位符，之後步驟五再回來更新：
+4. 已授權的重新導向 URI，點擊 **+ 新增 URI**：
+   > **注意**：此時還不知道 Container App domain，先填佔位符，步驟五取得 URL 後回來更新：
    > `https://placeholder.example.com/oauth2callback`
 5. 點擊 **建立**
 6. 記下 **用戶端 ID** 和 **用戶端密鑰**（`GOOGLE_WEB_CLIENT_ID` / `GOOGLE_WEB_CLIENT_SECRET`）
@@ -97,15 +99,13 @@ https://github.com/<使用者GitHub帳號>/gmail-pdf-mcp
 > 請先確認使用者已安裝 Azure CLI 並執行 `az login` 登入正確帳號。
 > 若未安裝，請使用者先下載：https://aka.ms/installazurecliwindows
 
-請 Claude 執行以下指令（依序執行，每步驟確認成功再繼續）：
+**注意**：若在 Git Bash 執行，所有 `az` 指令前須加 `MSYS_NO_PATHCONV=1` 避免路徑轉換問題。
 
 ```bash
-# 設定變數（讓使用者決定名稱，或使用預設值）
 RESOURCE_GROUP="rg-gmail-pdf"
 LOCATION="eastasia"
-ACR_NAME="acrgmailpdf$RANDOM"        # Container Registry（全域唯一）
-STORAGE_NAME="sagmailpdf$RANDOM"     # Storage Account（全域唯一）
-KV_NAME="kv-gmailpdf-$RANDOM"        # Key Vault（全域唯一）
+ACR_NAME="acrgmailpdf$RANDOM"     # Container Registry（全域唯一）
+KV_NAME="kv-gmailpdf-$RANDOM"    # Key Vault（全域唯一）
 CONTAINER_APP_NAME="gmail-pdf-mcp"
 CONTAINER_ENV_NAME="gmail-pdf-env"
 
@@ -115,24 +115,17 @@ az group create --name $RESOURCE_GROUP --location $LOCATION
 # 2. 建立 Container Registry
 az acr create --name $ACR_NAME --resource-group $RESOURCE_GROUP --sku Basic --admin-enabled true
 
-# 3. 建立 Storage Account 和容器
-az storage account create --name $STORAGE_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --sku Standard_LRS
-az storage container create --name gmail-pdfs --account-name $STORAGE_NAME
-
-# 4. 建立 Key Vault
+# 3. 建立 Key Vault（用於備用 refresh token）
 az keyvault create --name $KV_NAME --resource-group $RESOURCE_GROUP --location $LOCATION
 
-# 5. 取得 ACR 登入資訊（記下這些值，步驟四需要用到）
+# 4. 取得 ACR 登入資訊（記下這些值，步驟四需要用到）
 az acr show --name $ACR_NAME --query loginServer -o tsv
 az acr credential show --name $ACR_NAME --query "passwords[0].value" -o tsv
 
-# 6. 取得 Storage Account Key（步驟四需要用到）
-az storage account keys list --account-name $STORAGE_NAME --query "[0].value" -o tsv
-
-# 7. 建立 Container Apps 環境
+# 5. 建立 Container Apps 環境
 az containerapp env create --name $CONTAINER_ENV_NAME --resource-group $RESOURCE_GROUP --location $LOCATION
 
-# 8. 建立初始 Container App（用 hello-world 暫代，之後 CI/CD 會更新）
+# 6. 建立初始 Container App（用 hello-world 暫代，CI/CD 會更新）
 az containerapp create \
   --name $CONTAINER_APP_NAME \
   --resource-group $RESOURCE_GROUP \
@@ -143,7 +136,7 @@ az containerapp create \
   --min-replicas 0 \
   --max-replicas 2
 
-# 9. 取得 Container App URL
+# 7. 取得 Container App URL
 az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv
 ```
 
@@ -157,11 +150,9 @@ https://<Container App URL>/oauth2callback
 ### 建立 GitHub Actions Service Principal
 
 ```bash
-# 取得 Subscription ID
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-# 建立 Service Principal
-az ad sp create-for-rbac \
+MSYS_NO_PATHCONV=1 az ad sp create-for-rbac \
   --name "github-actions-gmail-pdf" \
   --role contributor \
   --scopes /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP \
@@ -180,7 +171,7 @@ az ad sp create-for-rbac \
 |---|---|
 | `AZURE_CREDENTIALS` | 步驟三最後的 Service Principal JSON |
 | `ACR_LOGIN_SERVER` | ACR 的 login server URL（例如 `acrgmailpdf12345.azurecr.io`） |
-| `ACR_USERNAME` | ACR admin username（通常與 ACR 名稱相同） |
+| `ACR_USERNAME` | ACR admin username（與 ACR 名稱相同） |
 | `ACR_PASSWORD` | ACR admin password |
 | `RESOURCE_GROUP` | `rg-gmail-pdf` |
 | `GOOGLE_WEB_CLIENT_ID` | 步驟 2-3 的用戶端 ID |
@@ -198,9 +189,6 @@ az containerapp update \
   --resource-group rg-gmail-pdf \
   --set-env-vars \
     AZURE_DEPLOYMENT=true \
-    AZURE_STORAGE_ACCOUNT_NAME=<STORAGE_NAME> \
-    AZURE_STORAGE_CONTAINER_NAME=gmail-pdfs \
-    AZURE_STORAGE_ACCOUNT_KEY=<Storage Account Key> \
     GOOGLE_WEB_CLIENT_ID=<用戶端 ID> \
     GOOGLE_WEB_CLIENT_SECRET=<用戶端密鑰> \
     OAUTH_CALLBACK_URL=https://<Container App URL>/oauth2callback \
@@ -211,9 +199,9 @@ az containerapp update \
 
 ## 步驟六：觸發 CI/CD 部署
 
-請使用者在 GitHub 網頁上對 `README.md` 做任何小修改（例如加一個空行），commit 後就會觸發 GitHub Actions 自動 build + deploy。
+請使用者在 GitHub 網頁上對 `README.md` 做任何小修改（例如加空行），commit 後觸發 GitHub Actions 自動 build + deploy。
 
-或由 Claude 在 clone 下來的 repo 執行：
+或由 Claude 執行：
 ```bash
 git commit --allow-empty -m "trigger deploy"
 git push
@@ -221,13 +209,19 @@ git push
 
 前往 GitHub repo → **Actions** 頁面確認 workflow 執行成功（綠色勾勾）。
 
+部署完成後驗證：
+```bash
+curl https://<Container App URL>/health
+# 應回傳 {"status":"ok"}
+```
+
 ---
 
 ## 步驟七：設定 Claude 使用 MCP Server
 
 ### Claude Code（VS Code 擴充套件）
 
-在 `C:\Users\<使用者名稱>\.claude.json` 中加入（由 Claude 執行）：
+在 `C:\Users\<使用者名稱>\.claude.json` 中加入 `mcpServers` 欄位（由 Claude 執行）：
 
 ```json
 "mcpServers": {
@@ -238,7 +232,7 @@ git push
 }
 ```
 
-重新載入 VS Code 視窗（Ctrl+Shift+P → Developer: Reload Window）。
+重新載入 VS Code 視窗（`Ctrl+Shift+P` → `Developer: Reload Window`）。
 
 ### Claude Desktop App
 
@@ -257,17 +251,29 @@ git push
 
 完全退出 Claude Desktop App（系統列右鍵 → Quit），再重新開啟。
 
+> **注意**：Claude Desktop App 不支援直接使用 `"type": "http"` 連接遠端 MCP，必須透過 `mcp-remote` 作為本機代理。需要先安裝 Node.js。
+
 ---
 
-## 步驟八：授權 Gmail 並測試
+## 步驟八：測試
 
-在 Claude 中執行：
+Server 實作了 MCP Authorization 規範，**連線時會自動彈出 Google 授權頁面**：
 
-1. **授權**：呼叫 `authorize_gmail` 工具 → 點擊回傳的連結 → 用自己的 Gmail 帳號登入授權
-2. **搜尋測試**：呼叫 `search_emails`，query 輸入 `發票`，max_results 輸入 `3`
-3. **轉 PDF 測試**：呼叫 `batch_convert_emails`，query 輸入 `發票`
+1. 在 Claude 中使用任何 gmail-pdf 工具（例如 `search_emails`）
+2. Claude 會自動開啟瀏覽器 → 用自己的 Google 帳號登入授權（同時授權 Gmail 讀取 + Google Drive 存檔）
+3. 授權完成後直接使用工具，不需要任何額外步驟
 
-成功後會回傳 PDF 的下載連結（Azure Blob Storage SAS URL，24 小時有效）。
+**測試搜尋**：
+```
+請搜尋主旨含「發票」的郵件，最多 3 封
+```
+
+**測試轉 PDF**：
+```
+請把主旨含「發票」的郵件轉成 PDF
+```
+
+成功後 PDF 會存到使用者的 Google Drive，路徑為 `Gmail PDF MCP/{寄件人名稱}/{檔名}.pdf`，回傳 Google Drive 分享連結。
 
 ---
 
@@ -275,35 +281,44 @@ git push
 
 | 工具 | 用途 |
 |---|---|
-| `authorize_gmail` | 取得 Gmail 授權連結（每個使用者第一次使用需執行） |
+| `authorize_gmail` | 手動取得授權連結（通常不需要，連線時自動觸發；可用於重新授權） |
 | `check_gmail_auth` | 確認目前 session 是否已授權 |
-| `search_emails` | 搜尋 Gmail，參數：`query`（關鍵字）、`max_results`（上限 50） |
+| `search_emails` | 搜尋 Gmail，參數：`query`（Gmail 搜尋語法）、`max_results`（上限 50） |
 | `fetch_email_content` | 取得單封郵件完整內容 |
-| `convert_email_to_pdf` | 將單封郵件轉為 PDF |
+| `convert_email_to_pdf` | 將單封郵件轉為 PDF 並存到 Google Drive |
 | `batch_convert_emails` | 搜尋 + 批次轉 PDF（最常用），參數：`query`、`max_results`（上限 20） |
-| `download_pdf_locally` | 將 Blob 上的 PDF 下載到本機指定路徑 |
+
+> `search_emails` 支援完整 Gmail 搜尋語法，例如：
+> - `發票` — 任何欄位含「發票」
+> - `subject:發票 after:2026/3/1 before:2026/4/1` — 三月份主旨含「發票」
 
 ---
 
 ## 注意事項
 
-- **Gmail 授權是 per-session**：每次 MCP session 重新建立（例如重啟 Claude Desktop App）都需要重新執行 `authorize_gmail`。這是設計上的安全考量。
-- **PDF SAS 連結 24 小時有效**：之後需要重新執行 `batch_convert_emails` 產生新連結，或用 `download_pdf_locally` 先下載到本機。
-- **Container App 冷啟動**：若 Container App 設定最小 replica 為 0，第一次呼叫可能需要等 10-20 秒啟動。
-- **Google OAuth 同意畫面**：若 App 還在「測試中」狀態，只有測試使用者名單內的帳號可以授權。若要開放給任何人使用，需要在 Google Cloud Console 提交 App 審核，或將每個使用者加入測試名單。
+- **Gmail 授權是 per-session**：每次 MCP session 重新建立（例如重啟 Claude Desktop App）會需要重新授權。Claude Desktop App 連線時會自動跳出授權頁面。
+- **Google OAuth 同意畫面**：App 在「測試中」狀態時，只有測試使用者名單內的帳號可以授權。若要開放給同事使用，需在 Google Cloud Console 將同事帳號加入測試名單，或提交 App 審核。
+- **Container App 冷啟動**：最小 replica 為 0 時，第一次呼叫可能需要等 10-20 秒啟動。
+- **PDF 存放位置**：PDF 存在**各自使用者**的 Google Drive（授權時登入哪個帳號，PDF 就存到哪個帳號），路徑為 `Gmail PDF MCP/{寄件人}/`。
 
 ---
 
 ## 常見問題
 
-**Q: `authorize_gmail` 後呼叫工具出現 `unauthorized_client`**
-A: Session 可能已過期（Container App 重啟會清除記憶體中的 session）。重新執行 `authorize_gmail` 即可。
+**Q: 連線後沒有跳出授權頁面**
+A: 確認 `OAUTH_CALLBACK_URL` 環境變數已設定，且 Google OAuth client 的重新導向 URI 與 `OAUTH_CALLBACK_URL` 完全一致（含 `/oauth2callback`）。
+
+**Q: 呼叫工具出現 `unauthorized_client`**
+A: Session 已過期（Container App 重啟會清除記憶體中的 token）。重新連線或呼叫 `authorize_gmail` 取得新授權連結。
 
 **Q: GitHub Actions 失敗，顯示 ACR login error**
-A: 確認 `ACR_USERNAME`、`ACR_PASSWORD`、`ACR_LOGIN_SERVER` 三個 Secret 都填寫正確。
+A: 確認 `ACR_USERNAME`、`ACR_PASSWORD`、`ACR_LOGIN_SERVER` 三個 Secret 填寫正確。
 
 **Q: Container App 部署成功但 `/health` 回傳 404**
-A: 可能還在啟動中，等 30 秒再試。或檢查 Azure Portal → Container App → Log stream 查看啟動錯誤。
+A: 可能還在啟動中，等 30 秒再試。或至 Azure Portal → Container App → Log stream 查看錯誤。
 
 **Q: PDF 內容空白或中文亂碼**
-A: Container App 已安裝 `fonts-noto-cjk`，若仍有問題請在 Azure Portal 查看 Container App logs。
+A: Container App 已內建 `fonts-noto-cjk`，若仍有問題請查看 Container App logs。
+
+**Q: Google Drive 找不到 PDF**
+A: 確認授權時選的是正確的 Google 帳號。PDF 存在 Drive 根目錄的 `Gmail PDF MCP/` 資料夾下。
