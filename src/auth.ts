@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash, randomBytes } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import http from 'http';
@@ -16,11 +16,33 @@ const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
 
 const isAzure = process.env.AZURE_DEPLOYMENT === 'true';
 
-// Per-session OAuth2 clients (keyed by MCP session ID)
+// Per-session OAuth2 clients (keyed by auth session ID)
 const sessionClients = new Map<string, OAuth2Client>();
 
-// Pending Web OAuth states: state UUID → session ID
+// Pending Web OAuth states: state UUID → session ID (manual authorize_gmail tool)
 const pendingOAuthStates = new Map<string, string>();
+
+// ── MCP Authorization flow (RFC 6749 / MCP spec 2025-03) ──────────────────────
+
+interface PendingMcpFlow {
+  sessionId: string;
+  mcpRedirectUri: string;
+  mcpState: string;
+  codeChallenge: string;   // PKCE S256
+}
+
+// googleState → MCP flow (in-flight Google OAuth for MCP client)
+const pendingMcpFlows = new Map<string, PendingMcpFlow>();
+
+// mcpAuthCode → { sessionId, codeChallenge, redirectUri }
+const pendingMcpCodes = new Map<string, {
+  sessionId: string;
+  codeChallenge: string;
+  redirectUri: string;
+}>();
+
+// bearer token → auth session ID
+const bearerTokens = new Map<string, string>();
 
 // ── Azure Key Vault helpers ────────────────────────────────────────────────────
 
@@ -199,6 +221,88 @@ export function getSessionAuthStatus(sessionId: string): 'authorized' | 'pending
     if (sid === sessionId) return 'pending';
   }
   return 'none';
+}
+
+// ── MCP Authorization helpers ──────────────────────────────────────────────────
+
+/**
+ * Start an MCP Authorization flow: create a fresh session, record the MCP
+ * client's PKCE challenge and redirect URI, then return the Google OAuth URL.
+ */
+export function startMcpOAuthFlow(params: {
+  mcpRedirectUri: string;
+  mcpState: string;
+  codeChallenge: string;
+}): string {
+  const sessionId = randomUUID();
+  const googleState = randomUUID();
+
+  pendingMcpFlows.set(googleState, {
+    sessionId,
+    mcpRedirectUri: params.mcpRedirectUri,
+    mcpState: params.mcpState,
+    codeChallenge: params.codeChallenge,
+  });
+  setTimeout(() => pendingMcpFlows.delete(googleState), 10 * 60 * 1000);
+
+  const { clientId, clientSecret } = loadWebCredentials();
+  const client = new OAuth2Client(clientId, clientSecret, getOAuthCallbackUrl());
+  return client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', state: googleState });
+}
+
+/**
+ * Called from /oauth2callback. If the state belongs to an MCP flow, exchange
+ * the Google code for tokens, issue our own one-time auth code, and return the
+ * redirect info so the caller can send the user back to the MCP client.
+ * Returns null if the state belongs to the manual authorize_gmail tool instead.
+ */
+export async function completeMcpOAuthCallback(
+  googleState: string,
+  googleCode: string,
+): Promise<{ mcpRedirectUri: string; mcpState: string; mcpAuthCode: string } | null> {
+  const flow = pendingMcpFlows.get(googleState);
+  if (!flow) return null;
+  pendingMcpFlows.delete(googleState);
+
+  const { clientId, clientSecret } = loadWebCredentials();
+  const client = new OAuth2Client(clientId, clientSecret, getOAuthCallbackUrl());
+  const { tokens } = await client.getToken(googleCode);
+  client.setCredentials(tokens);
+  sessionClients.set(flow.sessionId, client);
+  console.error(`[auth] Session ${flow.sessionId.slice(0, 8)} authorized via MCP OAuth flow`);
+
+  const mcpAuthCode = randomBytes(32).toString('hex');
+  pendingMcpCodes.set(mcpAuthCode, {
+    sessionId: flow.sessionId,
+    codeChallenge: flow.codeChallenge,
+    redirectUri: flow.mcpRedirectUri,
+  });
+  setTimeout(() => pendingMcpCodes.delete(mcpAuthCode), 5 * 60 * 1000);
+
+  return { mcpRedirectUri: flow.mcpRedirectUri, mcpState: flow.mcpState, mcpAuthCode };
+}
+
+/**
+ * Token endpoint handler: verify PKCE and redirect_uri, then issue a bearer token.
+ * Returns the bearer token string on success, or null on failure.
+ */
+export function exchangeMcpCode(code: string, codeVerifier: string, redirectUri: string): string | null {
+  const pending = pendingMcpCodes.get(code);
+  if (!pending) return null;
+
+  const expected = createHash('sha256').update(codeVerifier).digest('base64url');
+  if (expected !== pending.codeChallenge || redirectUri !== pending.redirectUri) return null;
+
+  pendingMcpCodes.delete(code);
+
+  const token = randomBytes(32).toString('hex');
+  bearerTokens.set(token, pending.sessionId);
+  return token;
+}
+
+/** Validate a bearer token. Returns the auth session ID or null. */
+export function validateBearerToken(token: string): string | null {
+  return bearerTokens.get(token) ?? null;
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────

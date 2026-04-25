@@ -9,7 +9,10 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { getAuthClientForSession, generateWebAuthUrl, completeOAuthCallback, getSessionAuthStatus } from './auth.js';
+import {
+  getAuthClientForSession, generateWebAuthUrl, completeOAuthCallback, getSessionAuthStatus,
+  startMcpOAuthFlow, completeMcpOAuthCallback, exchangeMcpCode, validateBearerToken,
+} from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
@@ -365,38 +368,128 @@ async function main() {
     const app = express();
     app.use(express.json());
 
-    // Per-session transport map: each client gets its own Server + Transport pair
+    // Per-session MCP transport map (keyed by MCP transport session ID)
     const transports = new Map<string, StreamableHTTPServerTransport>();
 
-    app.all('/mcp', async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    // ── MCP Authorization spec endpoints ──────────────────────────────────────
 
-      if (sessionId && transports.has(sessionId)) {
-        // Existing session — forward to stored transport
-        await transports.get(sessionId)!.handleRequest(req, res, req.body);
+    // RFC 9728 — Protected Resource Metadata
+    app.get('/.well-known/oauth-protected-resource', (req, res) => {
+      const base = `https://${req.hostname}`;
+      res.json({
+        resource: `${base}/mcp`,
+        authorization_servers: [base],
+      });
+    });
+
+    // RFC 8414 — Authorization Server Metadata
+    app.get('/.well-known/oauth-authorization-server', (req, res) => {
+      const base = `https://${req.hostname}`;
+      res.json({
+        issuer: base,
+        authorization_endpoint: `${base}/authorize`,
+        token_endpoint: `${base}/token`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+      });
+    });
+
+    // Authorization endpoint — redirect user through Google OAuth
+    app.get('/authorize', (req, res) => {
+      const { response_type, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+      if (
+        response_type !== 'code' ||
+        code_challenge_method !== 'S256' ||
+        !redirect_uri || !state || !code_challenge
+      ) {
+        res.status(400).json({ error: 'invalid_request' });
+        return;
+      }
+      const googleUrl = startMcpOAuthFlow({
+        mcpRedirectUri: redirect_uri as string,
+        mcpState: state as string,
+        codeChallenge: code_challenge as string,
+      });
+      res.redirect(302, googleUrl);
+    });
+
+    // Token endpoint — exchange auth code for bearer token (PKCE verified)
+    app.post('/token', express.urlencoded({ extended: false }), (req, res) => {
+      const { grant_type, code, redirect_uri, code_verifier } = req.body as Record<string, string>;
+      if (grant_type !== 'authorization_code' || !code || !redirect_uri || !code_verifier) {
+        res.status(400).json({ error: 'invalid_request' });
+        return;
+      }
+      const token = exchangeMcpCode(code, code_verifier, redirect_uri);
+      if (!token) {
+        res.status(400).json({ error: 'invalid_grant' });
+        return;
+      }
+      res.json({ access_token: token, token_type: 'bearer' });
+    });
+
+    // ── MCP endpoint (requires Bearer token) ──────────────────────────────────
+
+    app.all('/mcp', async (req, res) => {
+      // Validate Bearer token → resolve auth session
+      const authHeader = req.headers['authorization'];
+      if (!authHeader?.startsWith('Bearer ')) {
+        const base = `https://${req.hostname}`;
+        res.status(401)
+          .set('WWW-Authenticate', `Bearer realm="mcp", resource_metadata_url="${base}/.well-known/oauth-protected-resource"`)
+          .json({ error: 'unauthorized' });
+        return;
+      }
+      const authSessionId = validateBearerToken(authHeader.slice(7));
+      if (!authSessionId) {
+        res.status(401)
+          .set('WWW-Authenticate', 'Bearer realm="mcp", error="invalid_token"')
+          .json({ error: 'invalid_token' });
         return;
       }
 
-      // New session — create a fresh Server + Transport pair
-      const newSessionId = randomUUID();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
-      });
-      transport.onclose = () => transports.delete(newSessionId);
-      transports.set(newSessionId, transport);
+      // Route MCP transport (separate from auth session)
+      const mcpSessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (mcpSessionId && transports.has(mcpSessionId)) {
+        await transports.get(mcpSessionId)!.handleRequest(req, res, req.body);
+        return;
+      }
 
-      const server = createMcpServer(newSessionId);
+      // New transport bound to this authenticated user
+      const newMcpSessionId = randomUUID();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => newMcpSessionId,
+      });
+      transport.onclose = () => transports.delete(newMcpSessionId);
+      transports.set(newMcpSessionId, transport);
+
+      const server = createMcpServer(authSessionId);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     });
 
-    // OAuth2 callback — Google redirects here after user authorization
+    // ── OAuth2 callback (handles both MCP flow and manual authorize_gmail) ────
+
     app.get('/oauth2callback', async (req, res) => {
       const { code, state, error } = req.query;
       if (error || !code || !state) {
         res.status(400).send('<h1 style="font-family:sans-serif">授權失敗，請重新呼叫 authorize_gmail。</h1>');
         return;
       }
+
+      // MCP Authorization flow — redirect back to MCP client with our auth code
+      const mcpResult = await completeMcpOAuthCallback(state as string, code as string);
+      if (mcpResult) {
+        const redirect = new URL(mcpResult.mcpRedirectUri);
+        redirect.searchParams.set('code', mcpResult.mcpAuthCode);
+        redirect.searchParams.set('state', mcpResult.mcpState);
+        res.redirect(302, redirect.toString());
+        return;
+      }
+
+      // Manual authorize_gmail tool flow — show success page
       try {
         await completeOAuthCallback(state as string, code as string);
         res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;text-align:center;padding:60px">
