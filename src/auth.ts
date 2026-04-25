@@ -44,6 +44,11 @@ const pendingMcpCodes = new Map<string, {
 // bearer token → auth session ID
 const bearerTokens = new Map<string, string>();
 
+// Per-user schedule bearer tokens (bearer → email, persisted in Key Vault)
+const scheduleTokenMap = new Map<string, string>();
+// Per-user schedule OAuth clients (email → client, lazy-loaded from Key Vault)
+const scheduleClients = new Map<string, OAuth2Client>();
+
 // ── Azure Key Vault helpers ────────────────────────────────────────────────────
 
 function getKeyVaultClient(): SecretClient {
@@ -63,6 +68,43 @@ export async function saveRefreshTokenToKeyVault(refreshToken: string): Promise<
   const client = getKeyVaultClient();
   await client.setSecret('gmail-refresh-token', refreshToken);
   console.error('refresh_token saved to Key Vault.');
+}
+
+// ── Per-user schedule token helpers ───────────────────────────────────────────
+
+async function loadScheduleMap(): Promise<Map<string, string>> {
+  try {
+    const kv = getKeyVaultClient();
+    const secret = await kv.getSecret('gmail-schedule-map');
+    if (!secret.value) return new Map();
+    return new Map(Object.entries(JSON.parse(secret.value) as Record<string, string>));
+  } catch { return new Map(); }
+}
+
+async function persistScheduleMap(map: Map<string, string>): Promise<void> {
+  const kv = getKeyVaultClient();
+  await kv.setSecret('gmail-schedule-map', JSON.stringify(Object.fromEntries(map)));
+}
+
+async function saveUserRefreshToken(sanitizedEmail: string, refreshToken: string): Promise<void> {
+  const kv = getKeyVaultClient();
+  await kv.setSecret(`gmail-refresh-token-${sanitizedEmail}`, refreshToken);
+}
+
+async function getOrCreateScheduleClient(email: string): Promise<OAuth2Client> {
+  if (scheduleClients.has(email)) return scheduleClients.get(email)!;
+  const sanitized = email.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+  const kv = getKeyVaultClient();
+  const secret = await kv.getSecret(`gmail-refresh-token-${sanitized}`);
+  if (!secret.value) throw new Error(`找不到 ${email} 的排程 token，請先呼叫 save_schedule_token`);
+  const { clientId, clientSecret } = loadWebCredentials();
+  const client = new OAuth2Client(clientId, clientSecret);
+  client.setCredentials({ refresh_token: secret.value });
+  client.on('tokens', async (tokens) => {
+    if (tokens.refresh_token) await saveUserRefreshToken(sanitized, tokens.refresh_token).catch(() => {});
+  });
+  scheduleClients.set(email, client);
+  return client;
 }
 
 // ── Credential loaders ─────────────────────────────────────────────────────────
@@ -304,6 +346,8 @@ export function exchangeMcpCode(code: string, codeVerifier: string, redirectUri:
 export function validateBearerToken(token: string): string | null {
   const staticToken = process.env.STATIC_BEARER_TOKEN;
   if (staticToken && token === staticToken) return 'static';
+  const scheduleEmail = scheduleTokenMap.get(token);
+  if (scheduleEmail) return `schedule:${scheduleEmail}`;
   return bearerTokens.get(token) ?? null;
 }
 
@@ -311,12 +355,14 @@ export function validateBearerToken(token: string): string | null {
 
 /**
  * Returns an OAuth2 client for the session:
- * 1. 'static' session → Key Vault / local fallback (for unattended scheduled tasks)
- * 2. Session-level token from Web OAuth (per-user interactive)
- * 3. Key Vault / local token.json fallback
+ * 1. 'static' → Key Vault deployer account (STATIC_BEARER_TOKEN)
+ * 2. 'schedule:{email}' → per-user Key Vault refresh token (save_schedule_token)
+ * 3. UUID session → per-user Web OAuth client (interactive browser flow)
+ * 4. Fallback → Key Vault / local token.json
  */
 export async function getAuthClientForSession(sessionId: string): Promise<OAuth2Client> {
   if (sessionId === 'static') return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
+  if (sessionId.startsWith('schedule:')) return getOrCreateScheduleClient(sessionId.slice(9));
   if (sessionClients.has(sessionId)) return sessionClients.get(sessionId)!;
   return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
 }
@@ -324,6 +370,57 @@ export async function getAuthClientForSession(sessionId: string): Promise<OAuth2
 /** Backward-compatible shorthand (used by setup scripts) */
 export async function getAuthClient(): Promise<OAuth2Client> {
   return isAzure ? getAzureOAuth2Client() : getLocalOAuth2Client();
+}
+
+/**
+ * Load all per-user schedule tokens from Key Vault into memory.
+ * Called once at server startup in Azure mode.
+ */
+export async function initScheduleTokens(): Promise<void> {
+  if (!isAzure) return;
+  try {
+    const map = await loadScheduleMap();
+    for (const [token, email] of map) scheduleTokenMap.set(token, email);
+    console.error(`[auth] Loaded ${map.size} per-user schedule token(s) from Key Vault`);
+  } catch (e) {
+    console.error('[auth] Failed to load schedule tokens from Key Vault:', e);
+  }
+}
+
+/**
+ * Save the current session's refresh token to Key Vault and issue a
+ * permanent per-user static bearer token for use in scheduled tasks.
+ * Returns the bearer token and the user's email address.
+ */
+export async function saveScheduleToken(
+  sessionId: string,
+): Promise<{ token: string; email: string }> {
+  const sessionClient = sessionClients.get(sessionId);
+  if (!sessionClient) throw new Error('No active session — please authorize via browser first.');
+
+  const refreshToken = sessionClient.credentials.refresh_token;
+  if (!refreshToken) throw new Error('Session has no refresh token. Please re-authorize (revoke and re-connect).');
+
+  const { google } = await import('googleapis');
+  const gmail = google.gmail({ version: 'v1', auth: sessionClient });
+  const profile = await gmail.users.getProfile({ userId: 'me' });
+  const email = profile.data.emailAddress!;
+  const sanitized = email.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+
+  await saveUserRefreshToken(sanitized, refreshToken);
+
+  const map = await loadScheduleMap();
+  // Reuse existing token for this email if one already exists
+  const existing = [...map.entries()].find(([, e]) => e === email);
+  const token = existing?.[0] ?? randomBytes(32).toString('hex');
+  map.set(token, email);
+  await persistScheduleMap(map);
+  scheduleTokenMap.set(token, email);
+  // Pre-cache the client so the first scheduled call doesn't hit KV
+  scheduleClients.set(email, sessionClient);
+
+  console.error(`[auth] Schedule token saved for ${email}`);
+  return { token, email };
 }
 
 // Quick standalone test

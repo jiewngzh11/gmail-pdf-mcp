@@ -12,6 +12,7 @@ import {
 import {
   getAuthClientForSession, generateWebAuthUrl, completeOAuthCallback, getSessionAuthStatus,
   startMcpOAuthFlow, completeMcpOAuthCallback, exchangeMcpCode, validateBearerToken,
+  initScheduleTokens, saveScheduleToken,
 } from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
@@ -173,6 +174,11 @@ const TOOLS = [
       required: ['query'],
     },
   },
+  {
+    name: 'save_schedule_token',
+    description: '將目前的 Google 授權儲存為個人排程 token。呼叫後會回傳一個永久 bearer token，讓無人值守的排程任務可以用你自己的 Gmail 和 Google Drive 執行，不需要每次重新授權。每個 Google 帳號只需要設定一次。',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── Tool handlers (all receive sessionId for per-session auth) ─────────────────
@@ -237,6 +243,20 @@ async function handleConvertEmailToPdf(sessionId: string, args: Record<string, u
   const includeAttachments = args['include_attachments'] !== false;
   const auth = await getAuthClientForSession(sessionId);
   return doConvertEmail(auth, messageId, outputDir, includeAttachments);
+}
+
+async function handleSaveScheduleToken(sessionId: string) {
+  const { token, email } = await saveScheduleToken(sessionId);
+  return {
+    email,
+    token,
+    instructions: [
+      `✅ 排程 token 已儲存至 Key Vault（帳號：${email}）`,
+      `請將以下設定加入 .claude.json 的 mcpServers.gmail-pdf：`,
+      `"headers": { "Authorization": "Bearer ${token}" }`,
+      `設定好後，排程任務即可使用你的 Gmail 和 Google Drive，不需要重新授權。`,
+    ].join('\n'),
+  };
 }
 
 async function handleBatchConvertEmails(sessionId: string, args: Record<string, unknown>): Promise<BatchConversionResult> {
@@ -309,6 +329,9 @@ function createMcpServer(sessionId: string): Server {
           break;
         case 'batch_convert_emails':
           result = await handleBatchConvertEmails(sessionId, args as Record<string, unknown>);
+          break;
+        case 'save_schedule_token':
+          result = await handleSaveScheduleToken(sessionId);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
@@ -497,6 +520,8 @@ async function main() {
 
     // Health check for Azure Container Apps
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+    await initScheduleTokens();
 
     app.listen(port, () => {
       console.error(`Gmail PDF MCP Server listening on port ${port} (HTTP/SSE)`);
