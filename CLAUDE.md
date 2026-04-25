@@ -147,6 +147,35 @@ az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP
 https://<Container App URL>/oauth2callback
 ```
 
+### 啟用 Managed Identity 並授權 Key Vault
+
+Container App 需要 Managed Identity 才能存取 Key Vault（讀取與寫入 refresh token）：
+
+```bash
+# 啟用 system-assigned managed identity
+az containerapp identity assign \
+  --name $CONTAINER_APP_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --system-assigned
+
+# 取得 principal ID
+PRINCIPAL_ID=$(az containerapp identity show \
+  --name $CONTAINER_APP_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --query principalId -o tsv)
+
+# 取得 Key Vault resource ID
+KV_ID=$(az keyvault show --name $KV_NAME --resource-group $RESOURCE_GROUP --query id -o tsv)
+
+# 授予 Key Vault Secrets Officer（可讀取＋寫入 secret）
+az role assignment create \
+  --assignee $PRINCIPAL_ID \
+  --role "Key Vault Secrets Officer" \
+  --scope $KV_ID
+```
+
+> **為何需要 Secrets Officer**：`save_schedule_token` 工具會將每位使用者的 refresh token 寫入 Key Vault，需要寫入權限。若只有 `Key Vault Secrets User`（唯讀），排程 token 功能會失敗。
+
 ### 建立 GitHub Actions Service Principal
 
 ```bash
@@ -188,12 +217,16 @@ MSYS_NO_PATHCONV=1 az ad sp create-for-rbac \
 STATIC_TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 echo "STATIC_BEARER_TOKEN=$STATIC_TOKEN"
 
+# 取得 Key Vault URL
+KV_URL=$(az keyvault show --name <KV_NAME> --query properties.vaultUri -o tsv)
+
 # 設定所有環境變數
 az containerapp update \
   --name gmail-pdf-mcp \
   --resource-group rg-gmail-pdf \
   --set-env-vars \
     AZURE_DEPLOYMENT=true \
+    AZURE_KEY_VAULT_URL=$KV_URL \
     GOOGLE_WEB_CLIENT_ID=<用戶端 ID> \
     GOOGLE_WEB_CLIENT_SECRET=<用戶端密鑰> \
     OAUTH_CALLBACK_URL=https://<Container App URL>/oauth2callback \
@@ -379,3 +412,6 @@ A: 若使用 `STATIC_BEARER_TOKEN`，PDF 固定存到部署者的 Drive（預期
 
 **Q: `save_schedule_token` 回傳錯誤「Session has no refresh token」**
 A: Google 只在第一次授權時回傳 refresh token。請在 Google 帳號安全設定撤銷「Gmail PDF MCP」的存取，再重新連線授權，之後再呼叫 `save_schedule_token`。
+
+**Q: `save_schedule_token` 呼叫後 log 顯示 Key Vault 存取被拒**
+A: Container App 的 Managed Identity 缺少 Key Vault 寫入權限。請確認步驟三中已執行 `az role assignment create --role "Key Vault Secrets Officer"` 並且角色已生效（可能需要等 1-2 分鐘）。
