@@ -259,9 +259,9 @@ async function handleDownloadPdfLocally(args: Record<string, unknown>) {
   return { success: true, local_path: localPath };
 }
 
-// ── MCP Server ─────────────────────────────────────────────────────────────────
+// ── MCP Server factory ─────────────────────────────────────────────────────────
 
-async function main() {
+function createMcpServer(): Server {
   const server = new Server(
     { name: 'gmail-pdf-mcp', version: '1.0.0' },
     { capabilities: { tools: {} } }
@@ -307,6 +307,12 @@ async function main() {
     }
   });
 
+  return server;
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────────
+
+async function main() {
   const isAzure = process.env.AZURE_DEPLOYMENT === 'true';
 
   if (isAzure) {
@@ -314,23 +320,39 @@ async function main() {
     const app = express();
     app.use(express.json());
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
+    // Per-session transport map: each client gets its own Server + Transport pair
+    const transports = new Map<string, StreamableHTTPServerTransport>();
 
-    // MCP protocol over HTTP
     app.all('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+      if (sessionId && transports.has(sessionId)) {
+        // Existing session — forward to stored transport
+        await transports.get(sessionId)!.handleRequest(req, res, req.body);
+        return;
+      }
+
+      // New session — create a fresh Server + Transport pair
+      const newSessionId = randomUUID();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => newSessionId,
+      });
+      transport.onclose = () => transports.delete(newSessionId);
+      transports.set(newSessionId, transport);
+
+      const server = createMcpServer();
+      await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     });
 
     // Health check for Azure Container Apps
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-    await server.connect(transport);
     app.listen(port, () => {
       console.error(`Gmail PDF MCP Server listening on port ${port} (HTTP/SSE)`);
     });
   } else {
+    const server = createMcpServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('Gmail PDF MCP Server running on stdio');
