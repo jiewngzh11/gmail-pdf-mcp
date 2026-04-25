@@ -42,10 +42,13 @@ async function getOAuthClient(): Promise<OAuth2Client> {
 
 async function getRefreshToken(client: OAuth2Client): Promise<string> {
   // prompt=consent forces Google to issue a new refresh_token every time
+  // login_hint pre-selects the target Gmail account in the browser
+  const loginHint = process.env.GMAIL_USER_EMAIL ?? process.env.GOOGLE_LOGIN_HINT;
   const authUrl = client.generateAuthUrl({
     access_type: 'offline',
     scope: SCOPES,
     prompt: 'consent',
+    ...(loginHint ? { login_hint: loginHint } : {}),
   });
 
   const { default: open } = await import('open');

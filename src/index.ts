@@ -9,7 +9,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { getAuthClient } from './auth.js';
+import { getAuthClientForSession, startDeviceAuth, getDeviceAuthStatus } from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
@@ -21,11 +21,11 @@ import type { ConversionResult, BatchConversionResult } from './types.js';
 // ── Tool helpers ───────────────────────────────────────────────────────────────
 
 async function doConvertEmail(
+  auth: OAuth2Client,
   messageId: string,
   outputDir: string,
   includeAttachments: boolean
 ): Promise<ConversionResult> {
-  const auth = await getAuthClient();
   const message = await fetchEmail(auth, messageId);
 
   const paths = buildOutputPaths(outputDir, message.senderName, message.date);
@@ -68,6 +68,16 @@ async function doConvertEmail(
 // ── Tool definitions ───────────────────────────────────────────────────────────
 
 const TOOLS = [
+  {
+    name: 'authorize_gmail',
+    description: '取得 Google 裝置授權碼，讓使用者在瀏覽器用自己的帳號登入 Gmail',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'check_gmail_auth',
+    description: '檢查目前 session 的 Gmail 授權狀態',
+    inputSchema: { type: 'object', properties: {} },
+  },
   {
     name: 'search_emails',
     description: '搜尋 Gmail 中主旨包含指定關鍵字的郵件，回傳郵件列表',
@@ -168,26 +178,50 @@ const TOOLS = [
   },
 ];
 
-// ── Tool handlers ──────────────────────────────────────────────────────────────
+// ── Tool handlers (all receive sessionId for per-session auth) ─────────────────
 
-async function handleSearchEmails(args: Record<string, unknown>) {
-  const query = String(args['query']);
-  const maxResults = Math.min(Number(args['max_results'] ?? 10), 50);
-
-  const auth = await getAuthClient();
-  const results = await searchEmails(auth, query, maxResults);
-
+async function handleAuthorizeGmail(sessionId: string) {
+  const result = await startDeviceAuth(sessionId);
   return {
-    emails: results,
-    total_found: results.length,
+    verification_url: result.verification_url,
+    user_code: result.user_code,
+    expires_in_seconds: result.expires_in,
+    message: [
+      '請依照以下步驟完成 Gmail 授權：',
+      '',
+      `1. 開啟瀏覽器，前往：${result.verification_url}`,
+      `2. 輸入以下代碼（不含空格也可）：${result.user_code}`,
+      '3. 登入你的 Google 帳號並點選「允許」',
+      '',
+      `授權碼 ${Math.floor(result.expires_in / 60)} 分鐘內有效。`,
+      '完成後可呼叫 check_gmail_auth 確認狀態，或直接呼叫其他工具。',
+    ].join('\n'),
   };
 }
 
-async function handleFetchEmailContent(args: Record<string, unknown>) {
-  const messageId = String(args['message_id']);
-  const auth = await getAuthClient();
-  const message = await fetchEmail(auth, messageId);
+async function handleCheckGmailAuth(sessionId: string) {
+  const status = getDeviceAuthStatus(sessionId);
+  const messages: Record<string, string> = {
+    authorized: '✅ 已授權，可以使用所有工具。',
+    pending: '⏳ 等待授權中，請完成瀏覽器的 Google 登入步驟。',
+    expired: '❌ 授權碼已過期，請重新呼叫 authorize_gmail。',
+    none: '⚠️ 尚未開始授權。請呼叫 authorize_gmail 取得授權碼。',
+  };
+  return { status, message: messages[status] };
+}
 
+async function handleSearchEmails(sessionId: string, args: Record<string, unknown>) {
+  const query = String(args['query']);
+  const maxResults = Math.min(Number(args['max_results'] ?? 10), 50);
+  const auth = await getAuthClientForSession(sessionId);
+  const results = await searchEmails(auth, query, maxResults);
+  return { emails: results, total_found: results.length };
+}
+
+async function handleFetchEmailContent(sessionId: string, args: Record<string, unknown>) {
+  const messageId = String(args['message_id']);
+  const auth = await getAuthClientForSession(sessionId);
+  const message = await fetchEmail(auth, messageId);
   return {
     message_id: message.messageId,
     subject: message.subject,
@@ -205,32 +239,29 @@ async function handleFetchEmailContent(args: Record<string, unknown>) {
   };
 }
 
-async function handleConvertEmailToPdf(args: Record<string, unknown>) {
+async function handleConvertEmailToPdf(sessionId: string, args: Record<string, unknown>) {
   const messageId = String(args['message_id']);
   const outputDir = args['output_dir'] ? String(args['output_dir']) : getDefaultOutputDir();
   const includeAttachments = args['include_attachments'] !== false;
-
-  const result = await doConvertEmail(messageId, outputDir, includeAttachments);
-  return result;
+  const auth = await getAuthClientForSession(sessionId);
+  return doConvertEmail(auth, messageId, outputDir, includeAttachments);
 }
 
-async function handleBatchConvertEmails(args: Record<string, unknown>): Promise<BatchConversionResult> {
+async function handleBatchConvertEmails(sessionId: string, args: Record<string, unknown>): Promise<BatchConversionResult> {
   const query = String(args['query']);
   const maxResults = Math.min(Number(args['max_results'] ?? 5), 20);
   const outputDir = args['output_dir'] ? String(args['output_dir']) : getDefaultOutputDir();
   const includeAttachments = args['include_attachments'] !== false;
 
-  const auth = await getAuthClient();
+  const auth = await getAuthClientForSession(sessionId);
   const emails = await searchEmails(auth, query, maxResults);
 
-  let processed = 0;
-  let failed = 0;
+  let processed = 0, failed = 0;
   const results: ConversionResult[] = [];
 
   for (const email of emails) {
     try {
-      const result = await doConvertEmail(email.messageId, outputDir, includeAttachments);
-      results.push(result);
+      results.push(await doConvertEmail(auth, email.messageId, outputDir, includeAttachments));
       processed++;
     } catch (err) {
       const msg = (err as Error).message;
@@ -261,7 +292,7 @@ async function handleDownloadPdfLocally(args: Record<string, unknown>) {
 
 // ── MCP Server factory ─────────────────────────────────────────────────────────
 
-function createMcpServer(): Server {
+function createMcpServer(sessionId: string): Server {
   const server = new Server(
     { name: 'gmail-pdf-mcp', version: '1.0.0' },
     { capabilities: { tools: {} } }
@@ -276,17 +307,23 @@ function createMcpServer(): Server {
       let result: unknown;
 
       switch (name) {
+        case 'authorize_gmail':
+          result = await handleAuthorizeGmail(sessionId);
+          break;
+        case 'check_gmail_auth':
+          result = await handleCheckGmailAuth(sessionId);
+          break;
         case 'search_emails':
-          result = await handleSearchEmails(args as Record<string, unknown>);
+          result = await handleSearchEmails(sessionId, args as Record<string, unknown>);
           break;
         case 'fetch_email_content':
-          result = await handleFetchEmailContent(args as Record<string, unknown>);
+          result = await handleFetchEmailContent(sessionId, args as Record<string, unknown>);
           break;
         case 'convert_email_to_pdf':
-          result = await handleConvertEmailToPdf(args as Record<string, unknown>);
+          result = await handleConvertEmailToPdf(sessionId, args as Record<string, unknown>);
           break;
         case 'batch_convert_emails':
-          result = await handleBatchConvertEmails(args as Record<string, unknown>);
+          result = await handleBatchConvertEmails(sessionId, args as Record<string, unknown>);
           break;
         case 'download_pdf_locally':
           result = await handleDownloadPdfLocally(args as Record<string, unknown>);
@@ -340,7 +377,7 @@ async function main() {
       transport.onclose = () => transports.delete(newSessionId);
       transports.set(newSessionId, transport);
 
-      const server = createMcpServer();
+      const server = createMcpServer(newSessionId);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     });
@@ -352,7 +389,7 @@ async function main() {
       console.error(`Gmail PDF MCP Server listening on port ${port} (HTTP/SSE)`);
     });
   } else {
-    const server = createMcpServer();
+    const server = createMcpServer('local');
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('Gmail PDF MCP Server running on stdio');
