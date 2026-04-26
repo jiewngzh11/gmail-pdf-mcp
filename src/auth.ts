@@ -373,6 +373,35 @@ export async function getAuthClient(): Promise<OAuth2Client> {
 }
 
 /**
+ * Called after a bearer token is issued to automatically persist the user's
+ * credentials to Key Vault. Fire-and-forget — does not block the token response.
+ * After this runs, the token survives server restarts and can be used for
+ * scheduled tasks without re-authorization.
+ */
+export async function autoPersistBearerToken(token: string): Promise<void> {
+  if (!isAzure) return;
+  const sessionId = bearerTokens.get(token);
+  if (!sessionId) return;
+  const sessionClient = sessionClients.get(sessionId);
+  if (!sessionClient?.credentials.refresh_token) return;
+  if (scheduleTokenMap.has(token)) return; // already persisted
+
+  const { google } = await import('googleapis');
+  const gmail = google.gmail({ version: 'v1', auth: sessionClient });
+  const profile = await gmail.users.getProfile({ userId: 'me' });
+  const email = profile.data.emailAddress!;
+  const sanitized = email.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+
+  await saveUserRefreshToken(sanitized, sessionClient.credentials.refresh_token);
+  const map = await loadScheduleMap();
+  map.set(token, email);
+  await persistScheduleMap(map);
+  scheduleTokenMap.set(token, email);
+  scheduleClients.set(email, sessionClient);
+  console.error(`[auth] Auto-persisted credentials for ${email}`);
+}
+
+/**
  * Load all per-user schedule tokens from Key Vault into memory.
  * Called once at server startup in Azure mode.
  */
