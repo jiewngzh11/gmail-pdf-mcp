@@ -258,46 +258,22 @@ curl https://<Container App URL>/health
 
 ## 步驟七：設定 Claude 使用 MCP Server
 
-### Claude Code（VS Code 擴充套件）
+### Claude Code 和 Claude Desktop App（互動式使用）
 
-在 `C:\Users\<使用者名稱>\.claude.json` 中加入 `mcpServers` 欄位（由 Claude 執行）：
+兩種客戶端使用**完全相同**的設定方式，都透過 `mcp-remote` 連線：
 
+**Claude Code**：在 `C:\Users\<使用者名稱>\.claude.json` 中加入：
 ```json
 "mcpServers": {
   "gmail-pdf": {
-    "type": "http",
-    "url": "https://<Container App URL>/mcp"
+    "command": "npx",
+    "args": ["-y", "mcp-remote", "https://<Container App URL>/mcp"]
   }
 }
 ```
-
 重新載入 VS Code 視窗（`Ctrl+Shift+P` → `Developer: Reload Window`）。
 
-### Claude Code 排程任務（無人值守）
-
-**不需要任何額外設定。** 授權流程如下：
-
-1. **第一次連線**：瀏覽器自動跳出 Google 授權頁面，完成授權
-2. **自動持久化**：Server 在背景將你的 credentials 存入 Azure Key Vault
-3. **之後的所有連線與排程任務**：Server 從 Key Vault 載入，不需要重新授權
-
-排程任務的 `.claude.json` 設定與互動式完全相同，**不需要額外的 token 或 headers**：
-
-```json
-"mcpServers": {
-  "gmail-pdf": {
-    "type": "http",
-    "url": "https://<Container App URL>/mcp"
-  }
-}
-```
-
-> **每位使用者各自的帳號**：多人共用同一台 Server 時，每個人的 credentials 分別存在 Key Vault（以 Gmail 帳號為索引）。排程任務使用哪個 bearer token，PDF 就存到哪個人的 Google Drive。
-
-### Claude Desktop App
-
-在 `C:\Users\<使用者名稱>\AppData\Roaming\Claude\claude_desktop_config.json` 中加入：
-
+**Claude Desktop App**：在 `C:\Users\<使用者名稱>\AppData\Roaming\Claude\claude_desktop_config.json` 中加入：
 ```json
 {
   "mcpServers": {
@@ -308,20 +284,56 @@ curl https://<Container App URL>/health
   }
 }
 ```
-
 完全退出 Claude Desktop App（系統列右鍵 → Quit），再重新開啟。
 
-> **注意**：Claude Desktop App 不支援直接使用 `"type": "http"` 連接遠端 MCP，必須透過 `mcp-remote` 作為本機代理。需要先安裝 Node.js。
+**連線後的授權流程：**
+1. 第一次使用工具時，瀏覽器自動跳出 Google 授權頁面
+2. 用自己的 Google 帳號登入授權（Gmail 讀取 + Drive 存檔）
+3. `mcp-remote` 將 token 存在本機（`~/.mcp-auth/`），**之後重啟不需要再授權**
+4. Server 同時把 refresh token 備份到 Azure Key Vault，確保 token 永久有效
+
+> **需要先安裝 Node.js**（`mcp-remote` 透過 npx 執行）。
+
+### Claude Code 排程任務（Cowork / 無人值守）
+
+排程任務無法開啟瀏覽器，需要靜態 bearer token。這是一次性設定，完成後永久有效：
+
+**第一步：先做一次互動式授權**（按上方步驟，瀏覽器授權一次）
+
+**第二步：取得永久排程 token**，在 Claude 中說：
+```
+請呼叫 save_schedule_token
+```
+
+工具回傳你的永久 bearer token（例如 `a1b2c3...`）。
+
+**第三步：設定排程任務的 MCP config**：
+```json
+"mcpServers": {
+  "gmail-pdf": {
+    "type": "http",
+    "url": "https://<Container App URL>/mcp",
+    "headers": {
+      "Authorization": "Bearer <save_schedule_token 回傳的 token>"
+    }
+  }
+}
+```
+
+完成後，排程任務永遠使用你自己的 Gmail 和 Google Drive，不需要重新授權。
 
 ---
 
 ## 步驟八：測試
 
-Server 實作了 MCP Authorization 規範：
+**互動式使用（Claude Code / Claude Desktop）：**
+1. 第一次使用工具（例如 `search_emails`）→ 瀏覽器自動開啟 → 用 Google 帳號登入授權
+2. 之後重啟 Claude：`mcp-remote` 自動載入本機快取的 token，不需要再授權
 
-1. **第一次**：使用任何工具（例如 `search_emails`）→ 自動開啟瀏覽器 → 用自己的 Google 帳號登入授權
-2. **授權後**：credentials 自動存入 Key Vault（背景執行，約 2-3 秒）
-3. **之後**：Server 重啟、新 session、或排程任務，全部自動從 Key Vault 載入，不再跳出瀏覽器
+**排程任務（Cowork）：**
+1. 先完成一次互動式授權
+2. 呼叫 `save_schedule_token` 取得永久 token
+3. 設定到排程任務 config 的 `headers.Authorization`，之後排程永遠有效
 
 **測試搜尋**：
 ```
