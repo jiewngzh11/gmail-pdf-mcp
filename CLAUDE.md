@@ -164,17 +164,15 @@ PRINCIPAL_ID=$(az containerapp identity show \
   --resource-group $RESOURCE_GROUP \
   --query principalId -o tsv)
 
-# 取得 Key Vault resource ID
-KV_ID=$(az keyvault show --name $KV_NAME --resource-group $RESOURCE_GROUP --query id -o tsv)
-
-# 授予 Key Vault Secrets Officer（可讀取＋寫入 secret）
-az role assignment create \
-  --assignee $PRINCIPAL_ID \
-  --role "Key Vault Secrets Officer" \
-  --scope $KV_ID
+# 設定 Key Vault Access Policy（get、set、list 三個 secret 權限）
+az keyvault set-policy \
+  --name $KV_NAME \
+  --resource-group $RESOURCE_GROUP \
+  --object-id $PRINCIPAL_ID \
+  --secret-permissions get set list
 ```
 
-> **為何需要 Secrets Officer**：`save_schedule_token` 工具會將每位使用者的 refresh token 寫入 Key Vault，需要寫入權限。若只有 `Key Vault Secrets User`（唯讀），排程 token 功能會失敗。
+> **注意**：`az keyvault create` 預設使用 Access Policies（非 RBAC），所以必須用 `az keyvault set-policy` 設定存取，而不是 `az role assignment create`。若你的 Key Vault 有開啟 RBAC（`enableRbacAuthorization: true`），才改用 `Key Vault Secrets Officer` 角色。
 
 ### 建立 GitHub Actions Service Principal
 
