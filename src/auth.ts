@@ -321,6 +321,7 @@ export async function completeOAuthCallback(state: string, code: string): Promis
 
 export function getSessionAuthStatus(sessionId: string): 'authorized' | 'pending' | 'none' {
   if (sessionClients.has(sessionId)) return 'authorized';
+  if (sessionId === 'static' || sessionId.startsWith('schedule:')) return 'authorized';
   // Check if there's a pending state for this session
   for (const sid of pendingOAuthStates.values()) {
     if (sid === sessionId) return 'pending';
