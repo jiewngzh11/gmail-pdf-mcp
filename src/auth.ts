@@ -39,6 +39,7 @@ const pendingMcpCodes = new Map<string, {
   sessionId: string;
   codeChallenge: string;
   redirectUri: string;
+  bearerToken: string;
 }>();
 
 // bearer token → auth session ID
@@ -64,6 +65,11 @@ async function getRefreshTokenFromKeyVault(): Promise<string> {
   return secret.value;
 }
 
+function isKeyVaultSecretNotFound(err: unknown): boolean {
+  const e = err as { statusCode?: number; code?: string } | null;
+  return e?.statusCode === 404 || e?.code === 'SecretNotFound';
+}
+
 export async function saveRefreshTokenToKeyVault(refreshToken: string): Promise<void> {
   const client = getKeyVaultClient();
   await client.setSecret('gmail-refresh-token', refreshToken);
@@ -78,7 +84,10 @@ async function loadScheduleMap(): Promise<Map<string, string>> {
     const secret = await kv.getSecret('gmail-schedule-map');
     if (!secret.value) return new Map();
     return new Map(Object.entries(JSON.parse(secret.value) as Record<string, string>));
-  } catch { return new Map(); }
+  } catch (err) {
+    if (isKeyVaultSecretNotFound(err)) return new Map();
+    throw err;
+  }
 }
 
 async function persistScheduleMap(map: Map<string, string>): Promise<void> {
@@ -91,15 +100,69 @@ async function saveUserRefreshToken(sanitizedEmail: string, refreshToken: string
   await kv.setSecret(`gmail-refresh-token-${sanitizedEmail}`, refreshToken);
 }
 
+function sanitizeEmail(email: string): string {
+  return email.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+}
+
+async function getUserRefreshToken(sanitizedEmail: string): Promise<string | null> {
+  try {
+    const kv = getKeyVaultClient();
+    const secret = await kv.getSecret(`gmail-refresh-token-${sanitizedEmail}`);
+    return secret.value ?? null;
+  } catch (err) {
+    if (isKeyVaultSecretNotFound(err)) return null;
+    throw err;
+  }
+}
+
+async function getAuthenticatedEmail(client: OAuth2Client): Promise<string> {
+  const { google } = await import('googleapis');
+  const gmail = google.gmail({ version: 'v1', auth: client });
+  const profile = await gmail.users.getProfile({ userId: 'me' });
+  if (!profile.data.emailAddress) throw new Error('Could not resolve authorized Gmail account');
+  return profile.data.emailAddress;
+}
+
+async function persistAuthorizedClient(
+  sessionClient: OAuth2Client,
+): Promise<{ token: string; email: string }> {
+  const email = await getAuthenticatedEmail(sessionClient);
+  const sanitized = sanitizeEmail(email);
+  const refreshToken =
+    sessionClient.credentials.refresh_token ??
+    await getUserRefreshToken(sanitized);
+
+  if (!refreshToken) {
+    throw new Error(
+      `Google did not return a refresh token for ${email}. Revoke the app in Google Account permissions, then authorize again.`
+    );
+  }
+
+  if (!sessionClient.credentials.refresh_token) {
+    sessionClient.setCredentials({ ...sessionClient.credentials, refresh_token: refreshToken });
+  }
+
+  await saveUserRefreshToken(sanitized, refreshToken);
+
+  const map = await loadScheduleMap();
+  const existing = [...map.entries()].find(([, e]) => e === email);
+  const token = existing?.[0] ?? randomBytes(32).toString('hex');
+  map.set(token, email);
+  await persistScheduleMap(map);
+
+  scheduleTokenMap.set(token, email);
+  scheduleClients.set(email, sessionClient);
+  return { token, email };
+}
+
 async function getOrCreateScheduleClient(email: string): Promise<OAuth2Client> {
   if (scheduleClients.has(email)) return scheduleClients.get(email)!;
-  const sanitized = email.replace(/[^a-z0-9]/gi, '-').toLowerCase();
-  const kv = getKeyVaultClient();
-  const secret = await kv.getSecret(`gmail-refresh-token-${sanitized}`);
-  if (!secret.value) throw new Error(`找不到 ${email} 的排程 token，請先呼叫 save_schedule_token`);
+  const sanitized = sanitizeEmail(email);
+  const refreshToken = await getUserRefreshToken(sanitized);
+  if (!refreshToken) throw new Error(`No refresh token found for ${email}; please authorize again.`);
   const { clientId, clientSecret } = loadWebCredentials();
   const client = new OAuth2Client(clientId, clientSecret);
-  client.setCredentials({ refresh_token: secret.value });
+  client.setCredentials({ refresh_token: refreshToken });
   client.on('tokens', async (tokens) => {
     if (tokens.refresh_token) await saveUserRefreshToken(sanitized, tokens.refresh_token).catch(() => {});
   });
@@ -311,13 +374,15 @@ export async function completeMcpOAuthCallback(
   const { tokens } = await client.getToken(googleCode);
   client.setCredentials(tokens);
   sessionClients.set(flow.sessionId, client);
-  console.error(`[auth] Session ${flow.sessionId.slice(0, 8)} authorized via MCP OAuth flow`);
+  const persisted = await persistAuthorizedClient(client);
+  console.error(`[auth] Session ${flow.sessionId.slice(0, 8)} authorized via MCP OAuth flow for ${persisted.email}`);
 
   const mcpAuthCode = randomBytes(32).toString('hex');
   pendingMcpCodes.set(mcpAuthCode, {
     sessionId: flow.sessionId,
     codeChallenge: flow.codeChallenge,
     redirectUri: flow.mcpRedirectUri,
+    bearerToken: persisted.token,
   });
   setTimeout(() => pendingMcpCodes.delete(mcpAuthCode), 5 * 60 * 1000);
 
@@ -337,9 +402,10 @@ export function exchangeMcpCode(code: string, codeVerifier: string, redirectUri:
 
   pendingMcpCodes.delete(code);
 
-  const token = randomBytes(32).toString('hex');
-  bearerTokens.set(token, pending.sessionId);
-  return token;
+  if (!scheduleTokenMap.has(pending.bearerToken)) {
+    bearerTokens.set(pending.bearerToken, pending.sessionId);
+  }
+  return pending.bearerToken;
 }
 
 /** Validate a bearer token. Returns the auth session ID or null. */

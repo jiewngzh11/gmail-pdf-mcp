@@ -12,7 +12,7 @@ import {
 import {
   getAuthClientForSession, generateWebAuthUrl, completeOAuthCallback, getSessionAuthStatus,
   startMcpOAuthFlow, completeMcpOAuthCallback, exchangeMcpCode, validateBearerToken,
-  initScheduleTokens, saveScheduleToken, autoPersistBearerToken,
+  initScheduleTokens, saveScheduleToken,
 } from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
 import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
@@ -445,10 +445,6 @@ async function main() {
         return;
       }
       res.json({ access_token: token, token_type: 'bearer' });
-      // Auto-persist credentials to Key Vault so the token survives server restarts
-      autoPersistBearerToken(token).catch(err =>
-        console.error('[auth] auto-persist failed:', err)
-      );
     });
 
     // ── MCP endpoint (requires Bearer token) ──────────────────────────────────
