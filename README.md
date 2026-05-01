@@ -154,8 +154,8 @@ az containerapp create \
   --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
   --target-port 8080 \
   --ingress external \
-  --min-replicas 0 \
-  --max-replicas 2
+  --min-replicas 1 \
+  --max-replicas 1
 
 az containerapp show \
   --name $CONTAINER_APP_NAME \
@@ -163,6 +163,8 @@ az containerapp show \
   --query properties.configuration.ingress.fqdn \
   -o tsv
 ```
+
+`min-replicas 1` 會保留一個常駐 replica，適合排程任務與健康檢查，避免閒置後第一個 MCP tool call 因 Container App 冷啟動而 timeout。若只想省成本、且能接受第一次呼叫等待或失敗重試，可以改成 `--min-replicas 0`。
 
 如果在 Git Bash 執行 Azure CLI，請在可能被路徑轉換影響的 `az` 指令前加上：
 
@@ -408,6 +410,10 @@ Gmail PDF MCP/{寄件人}/{檔名}.pdf
 ### `/health` 回傳 404
 
 Container App 可能還在啟動，請等 30 秒後再試。若仍失敗，請到 Azure Portal 的 Container App Log stream 查看錯誤。
+
+### 第一個 MCP 工具呼叫顯示 server isn't responding
+
+如果 `search_emails`、`fetch_email_content` 後續正常，但第一個 `check_gmail_auth` 或其他工具短暫顯示 server 沒回應，通常是 Container App 設為 `min-replicas 0` 後的冷啟動 timeout。排程任務建議使用 `min-replicas 1`，或在排程流程中先打一次 `/health` 暖機再呼叫 MCP 工具。
 
 ### PDF 中文亂碼或空白
 
