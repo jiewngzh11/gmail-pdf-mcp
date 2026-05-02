@@ -215,6 +215,49 @@ export async function fetchAllAttachmentData(
   return results;
 }
 
+export async function markEmailsAsRead(
+  auth: AuthClient,
+  beforeDate: Date,
+  additionalQuery?: string
+): Promise<{ marked: number }> {
+  const gmail = getGmailClient(auth);
+
+  const y = beforeDate.getFullYear();
+  const m = beforeDate.getMonth() + 1;
+  const d = beforeDate.getDate();
+  const dateStr = `${y}/${m}/${d}`;
+  const q = `is:unread before:${dateStr}${additionalQuery ? ' ' + additionalQuery : ''}`;
+
+  const ids: string[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q,
+      maxResults: 500,
+      pageToken,
+    });
+    for (const msg of res.data.messages ?? []) {
+      if (msg.id) ids.push(msg.id);
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  if (ids.length === 0) return { marked: 0 };
+
+  // batchModify handles up to 1000 IDs per call
+  const CHUNK = 1000;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    await gmail.users.messages.batchModify({
+      userId: 'me',
+      requestBody: { ids: ids.slice(i, i + CHUNK), removeLabelIds: ['UNREAD'] },
+    });
+  }
+
+  return { marked: ids.length };
+}
+
 // Standalone test
 if (require.main === module) {
   (async () => {

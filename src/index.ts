@@ -15,7 +15,7 @@ import {
   initScheduleTokens, saveScheduleToken,
 } from './auth.js';
 import type { OAuth2Client } from 'google-auth-library';
-import { searchEmails, fetchEmail, fetchAllAttachmentData } from './gmail.js';
+import { searchEmails, fetchEmail, fetchAllAttachmentData, markEmailsAsRead } from './gmail.js';
 import { convertEmailToPdfBuffer, closeBrowser } from './pdf-converter.js';
 import { mergeEmailWithAttachments, countPdfPages } from './pdf-merger.js';
 import { saveToLocal, saveToDrive } from './storage.js';
@@ -179,6 +179,24 @@ const TOOLS = [
     description: '將目前的 Google 授權儲存為個人排程 token。呼叫後會回傳一個永久 bearer token，讓無人值守的排程任務可以用你自己的 Gmail 和 Google Drive 執行，不需要每次重新授權。每個 Google 帳號只需要設定一次。',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'mark_emails_as_read',
+    description: '將指定日期以前的所有未讀信件標示為已讀',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        before_date: {
+          type: 'string',
+          description: '日期（格式 YYYY-MM-DD），此日期當天及之前的未讀信件將被標示為已讀',
+        },
+        query: {
+          type: 'string',
+          description: '額外 Gmail 搜尋條件（可選），例如 "label:inbox" 或 "from:boss@example.com"',
+        },
+      },
+      required: ['before_date'],
+    },
+  },
 ];
 
 // ── Tool handlers (all receive sessionId for per-session auth) ─────────────────
@@ -259,6 +277,30 @@ async function handleSaveScheduleToken(sessionId: string) {
   };
 }
 
+async function handleMarkEmailsAsRead(sessionId: string, args: Record<string, unknown>) {
+  const beforeDateStr = String(args['before_date']);
+  const additionalQuery = args['query'] ? String(args['query']) : undefined;
+
+  const beforeDate = new Date(beforeDateStr);
+  if (isNaN(beforeDate.getTime())) {
+    throw new Error(`日期格式錯誤：${beforeDateStr}，請使用 YYYY-MM-DD 格式`);
+  }
+
+  // Shift to the day after so "before_date" is inclusive
+  const exclusiveDate = new Date(beforeDate);
+  exclusiveDate.setDate(exclusiveDate.getDate() + 1);
+
+  const auth = await getAuthClientForSession(sessionId);
+  const { marked } = await markEmailsAsRead(auth, exclusiveDate, additionalQuery);
+
+  return {
+    marked,
+    message: marked === 0
+      ? `✅ 沒有找到 ${beforeDateStr} 以前的未讀信件`
+      : `✅ 已將 ${marked} 封 ${beforeDateStr} 以前的未讀信件標示為已讀`,
+  };
+}
+
 async function handleBatchConvertEmails(sessionId: string, args: Record<string, unknown>): Promise<BatchConversionResult> {
   const query = String(args['query']);
   const maxResults = Math.min(Number(args['max_results'] ?? 5), 20);
@@ -332,6 +374,9 @@ function createMcpServer(sessionId: string): Server {
           break;
         case 'save_schedule_token':
           result = await handleSaveScheduleToken(sessionId);
+          break;
+        case 'mark_emails_as_read':
+          result = await handleMarkEmailsAsRead(sessionId, args as Record<string, unknown>);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
